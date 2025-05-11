@@ -8,6 +8,8 @@ This project delivers a comprehensive comparative analysis between two hospital 
 
 > **Note:** The original project utilized a PostgreSQL database connection as part of the academic assignment requirements. For GitHub portfolio purposes, the Tableau workbook has been modified to connect to CSV data files, making it portable while maintaining identical visualizations and findings.
 
+> **Note on Dashboard Formatting:** The dashboard layout on Tableau Public may appear slightly compressed compared to the original design. 
+
 ## Key Findings
 - **Hospitalization Duration Disparity**: BIMC demonstrated significantly shorter hospital stays (6 days for readmitted patients) compared to Medical Clean's concerning 64 days average
 - **Readmission Rate Comparison**: BIMC's overall readmission rate (20.68%) was lower than Medical Clean's (36.64%)
