@@ -1,0 +1,312 @@
+-- Create base tables
+CREATE TABLE mimic_patients (
+    patient_id VARCHAR(8) NOT NULL PRIMARY KEY,
+    gender CHAR(1),
+    age INT,
+    anchor_year VARCHAR(4),
+    year_group VARCHAR(11)
+);
+
+CREATE TABLE mimic_admissions (
+    admission_id VARCHAR(8) NOT NULL PRIMARY KEY,
+    admi_time VARCHAR(19),
+    dis_time VARCHAR(19),
+    ed_admi_time VARCHAR(19),
+    ed_dis_time VARCHAR(19),
+    patient_id VARCHAR(8) REFERENCES mimic_patients(patient_id)
+);
+
+CREATE TABLE drg_codes (
+    description TEXT,
+    patient_id VARCHAR(8) REFERENCES mimic_patients(patient_id),
+    admission_id VARCHAR(8) REFERENCES mimic_admissions(admission_id) ON DELETE CASCADE
+);
+
+-- Load initial data from CSV files
+COPY mimic_patients(patient_id, gender, age, anchor_year, year_group) 
+FROM 'C:\Users\Public\Downloads\patients.csv'
+WITH (FORMAT csv, HEADER true);
+
+COPY mimic_admissions(admission_id, admi_time, dis_time, ed_admi_time, ed_dis_time, patient_id) 
+FROM 'C:\Users\Public\Downloads\admissions.csv'
+WITH (FORMAT csv, HEADER true);
+
+COPY drg_codes(description, patient_id, admission_id) 
+FROM 'C:\Users\Public\Downloads\drgcodes.csv'
+WITH (FORMAT csv, HEADER true);
+
+-- Correct typo in existing patient table
+ALTER TABLE patient
+RENAME COLUMN hignblood TO highblood;
+
+-- Add and calculate duration in mimic_admissions
+ALTER TABLE mimic_admissions
+ADD COLUMN duration INTERVAL;
+
+UPDATE mimic_admissions
+SET duration = GREATEST(dis_time::TIMESTAMP, ed_dis_time::TIMESTAMP) -
+               LEAST(admi_time::TIMESTAMP, ed_admi_time::TIMESTAMP);
+
+-- Add readmission status column to mimic_patients
+ALTER TABLE mimic_patients
+ADD COLUMN readmission_status VARCHAR(3);
+
+-- Create temp table for calculating time between visits
+CREATE TEMP TABLE time_between_visits AS 
+SELECT 
+    admission_id, 
+    admi_time,
+    dis_time,
+    ed_admi_time,
+    ed_dis_time,
+    patient_id,
+    LEAST(admi_time::TIMESTAMP, ed_admi_time::TIMESTAMP) - 
+    LAG(GREATEST(dis_time::TIMESTAMP, ed_dis_time::TIMESTAMP)) 
+        OVER(PARTITION BY patient_id 
+        ORDER BY LEAST(admi_time::TIMESTAMP, ed_admi_time::TIMESTAMP)) 
+        AS time_since,
+    duration
+FROM mimic_admissions
+ORDER BY patient_id, admi_time;
+
+-- Delete data entry errors
+DELETE FROM time_between_visits
+WHERE time_since < '0'::INTERVAL;
+
+-- Update readmission status
+WITH patient_readmission AS (
+    SELECT patient_id, MIN(time_since),
+        CASE WHEN MIN(time_since) < '30 days'::INTERVAL
+             THEN 'Yes'
+             ELSE 'No'
+        END AS readmission_status
+    FROM time_between_visits
+    GROUP BY patient_id
+    ORDER BY patient_id
+)
+UPDATE mimic_patients AS MP
+SET readmission_status = PR.readmission_status
+FROM patient_readmission AS PR
+WHERE MP.patient_id = PR.patient_id;
+
+-- Create and populate beth_patients table
+CREATE TABLE beth_patients AS
+SELECT * 
+FROM mimic_patients
+WHERE readmission_status IS NOT NULL;
+
+ALTER TABLE beth_patients
+ADD PRIMARY KEY (patient_id);
+
+-- Modify beth_patients structure
+ALTER TABLE beth_patients
+DROP COLUMN anchor_year,
+DROP COLUMN year_group,
+ADD COLUMN network_id INTEGER DEFAULT 0;
+
+-- Add age_groups to beth_patients
+ALTER TABLE beth_patients
+ADD COLUMN age_groups VARCHAR(7) 
+GENERATED ALWAYS AS (
+    CASE WHEN age <= 39 THEN '18 - 39'
+         WHEN 40 <= age AND age <= 59 THEN '40 - 59'
+         ELSE '60 - 91' 
+    END
+) STORED;
+
+-- Add medical clean data to beth_patients
+INSERT INTO beth_patients (
+    network_id,
+    patient_id,
+    gender, 
+    age,
+    readmission_status    
+)
+SELECT 1 AS network_id,
+       patient_id,
+       CASE WHEN gender = 'Male' THEN 'M'
+       WHEN gender = 'Female' THEN 'F'
+       ELSE 'N' END AS gender,
+       age,
+       readmis AS readmission_status
+FROM patient;
+
+-- Create patient_conditions table
+CREATE TABLE patient_conditions (
+    stroke VARCHAR(3),
+    highblood VARCHAR(3),
+    overweight VARCHAR(3),
+    arthritis VARCHAR(3),
+    diabetes VARCHAR(3),
+    backpain VARCHAR(3),
+    anxiety VARCHAR(3),
+    allergic_rhinitis VARCHAR(3),
+    reflux_esophagitis VARCHAR(3),
+    asthma VARCHAR(3),
+    patient_id VARCHAR(8) REFERENCES beth_patients(patient_id) ON DELETE CASCADE,
+    admission_id VARCHAR(8) REFERENCES mimic_admissions(admission_id) ON DELETE CASCADE
+);
+
+-- Insert MIMIC conditions data
+INSERT INTO patient_conditions (
+    patient_id, stroke, highblood, overweight, arthritis, 
+    diabetes, backpain, anxiety, allergic_rhinitis, 
+    reflux_esophagitis, asthma)
+SELECT 
+    bp.patient_id,
+    MAX(CASE WHEN dc.description LIKE '%STROKE%' THEN 'Yes' ELSE 'No' END) AS stroke,
+    MAX(CASE WHEN dc.description LIKE '%HYPERTENSION%' THEN 'Yes' ELSE 'No' END) AS highblood,
+    MAX(CASE WHEN dc.description LIKE '%OBESITY%' THEN 'Yes' ELSE 'No' END) AS overweight,
+    MAX(CASE WHEN dc.description LIKE '%ARTHRITIS%' THEN 'Yes' ELSE 'No' END) AS arthritis,
+    MAX(CASE WHEN dc.description LIKE '%DIABETES%' THEN 'Yes' ELSE 'No' END) AS diabetes,
+    MAX(CASE WHEN dc.description LIKE '%BACK%' THEN 'Yes' ELSE 'No' END) AS backpain,
+    MAX(CASE WHEN dc.description LIKE '%ANXIETY%' THEN 'Yes' ELSE 'No' END) AS anxiety,
+    MAX(CASE WHEN dc.description LIKE '%ALLERGIC%' THEN 'Yes' ELSE 'No' END) AS allergic_rhinitis,
+    MAX(CASE WHEN dc.description LIKE '%ESOPHAGITIS%' THEN 'Yes' ELSE 'No' END) AS reflux_esophagitis,
+    MAX(CASE WHEN dc.description LIKE '%ASTHMA%' THEN 'Yes' ELSE 'No' END) AS asthma
+FROM beth_patients bp
+LEFT JOIN drg_codes dc
+ON bp.patient_id = dc.patient_id
+WHERE network_id <> 1
+GROUP BY bp.patient_id;
+
+-- Add medical clean data to patient_conditions
+INSERT INTO patient_conditions(
+    stroke, highblood, overweight, arthritis, diabetes, backpain, 
+    anxiety, allergic_rhinitis, reflux_esophagitis, asthma,
+    patient_id
+)
+SELECT pa.stroke,
+       pa.highblood,
+       sao.overweight,
+       sao.arthritis,
+       sao.diabetes,
+       sao.backpain,
+       sao.anxiety,
+       sao.allergic_rhinitis,
+       sao.reflux_esophagitis,
+       sao.asthma,
+       pa.patient_id
+FROM patient pa
+INNER JOIN servicesaddon sao
+USING(patient_id);
+
+-- Update medical clean conditions data
+UPDATE patient_conditions pc
+SET stroke = pa.stroke,
+    highblood = pa.highblood
+FROM patient pa
+WHERE pc.patient_id = pa.patient_id;
+
+UPDATE patient_conditions pc
+SET overweight = sao.overweight,
+    arthritis = sao.arthritis,
+    diabetes = sao.diabetes,
+    backpain = sao.backpain,
+    anxiety = sao.anxiety,
+    allergic_rhinitis = sao.allergic_rhinitis,
+    reflux_esophagitis = sao.reflux_esophagitis,
+    asthma = sao.asthma
+FROM servicesaddon sao
+WHERE pc.patient_id = sao.patient_id;
+
+-- Add and populate initial_days in beth_patients
+ALTER TABLE beth_patients
+ADD COLUMN initial_days FLOAT;
+
+-- Calculate initial_days for readmitted patients
+WITH assigning_previous_durations AS (
+    SELECT 
+        admission_id, admi_time, dis_time, patient_id, 
+        time_since, duration,
+        LAG(duration, 1) OVER(
+            PARTITION BY patient_id
+            ORDER BY LEAST(admi_time::TIMESTAMP, ed_admi_time::TIMESTAMP)
+        ) AS initial_days
+    FROM time_between_visits
+), averaging_readmission_durations AS (    
+    SELECT 
+        patient_id, AVG(assigning_previous_durations.initial_days) AS initial_days
+    FROM assigning_previous_durations
+    WHERE time_since < '30 days'::INTERVAL 
+    GROUP BY patient_id
+)
+UPDATE beth_patients bp
+SET initial_days = sub_q.initial_days::FLOAT
+FROM (
+    SELECT patient_id, 
+           EXTRACT(DAYS FROM initial_days) + 
+           EXTRACT(HOURS FROM initial_days)/24.0 +
+           EXTRACT(MINUTES FROM initial_days)/(24.0 * 60) as initial_days
+    FROM averaging_readmission_durations
+) AS sub_q
+WHERE bp.patient_id = sub_q.patient_id;
+
+-- Calculate initial_days for non-readmitted patients
+WITH group_non_readmitted AS (
+    SELECT bp.patient_id, AVG(tbv.duration) as initial_days
+    FROM beth_patients bp
+    INNER JOIN time_between_visits tbv
+    USING(patient_id)
+    WHERE bp.readmission_status = 'No'
+    GROUP BY bp.patient_id
+)
+UPDATE beth_patients bp
+SET initial_days = sub.initial_days::FLOAT
+FROM (
+    SELECT patient_id, 
+           EXTRACT(DAYS FROM initial_days) + 
+           EXTRACT(HOURS FROM initial_days)/24.0 +
+           EXTRACT(MINUTES FROM initial_days)/(24.0 * 60) as initial_days
+    FROM group_non_readmitted
+) AS sub
+WHERE bp.patient_id = sub.patient_id;
+
+-- Add medical clean initial days
+UPDATE beth_patients bp
+SET initial_days = pa.initial_days
+FROM patient pa
+WHERE bp.patient_id = pa.patient_id;
+
+-- Clean up negative initial days
+DELETE FROM beth_patients
+WHERE initial_days < 0;
+
+-- Create final tables
+CREATE TABLE all_patients AS
+SELECT *
+FROM beth_patients
+INNER JOIN patient_conditions
+USING(patient_id);
+
+ALTER TABLE all_patients
+DROP COLUMN admission_id;
+
+CREATE TABLE all_patients_unpivoted AS
+SELECT 
+    patient_id,
+    gender,
+    age,
+    readmission_status,
+    network_id,
+    age_groups,
+    initial_days,
+    KEY AS health_condition,
+    VALUE AS health_status
+FROM (
+    SELECT 
+        patient_id,   
+        gender,
+        age,
+        readmission_status,
+        network_id,
+        age_groups,
+        initial_days,
+        to_jsonb(all_patients) - 'patient_id' - 'gender' - 'age' - 'readmission_status' -
+        'network_id' - 'age_groups' - 'initial_days' AS health_data    
+    FROM all_patients
+) AS sub_q,
+jsonb_each_text(sub_q.health_data);
+
+DELETE FROM all_patients_unpivoted
+WHERE gender = 'N';
